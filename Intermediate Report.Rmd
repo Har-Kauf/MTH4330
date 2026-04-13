@@ -1,0 +1,203 @@
+---
+title: "MTH 4330 Project"
+author: "Arthur Faynin"
+date: "2026-04-7"
+output: pdf_document
+header-includes:
+# Add any LaTeX packages you want here -----------------------
+- \usepackage{amsmath}
+- \usepackage{amssymb}
+- \usepackage{graphicx}
+- \usepackage{enumitem}
+---
+
+
+
+<!-- Keep this block  -->
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+# Add any R packages you want here -----------------------
+library(rstudioapi)
+if (!require(randomForest)) {
+  install.packages("randomForest")
+  library(randomForest)
+}
+
+# Do not touch below this line ---------------------------
+# setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  paste0("\n \\", "footnotesize","\n\n", x, "\n\n \\normalsize")
+})
+```
+
+
+```{r echo=TRUE}
+
+# Store local copy of dataset to keep results constant
+df <- read.csv(url, stringsAsFactors = FALSE)
+write.csv(df, "nyc_data.csv", row.names = FALSE)
+```
+
+```{r echo=TRUE}
+
+## ------------------
+## Data Preprocessing
+## ------------------
+
+
+# change num here
+df <- read.csv("nyc_data.csv", stringsAsFactors = FALSE)
+
+dim(df)
+head(df)
+
+# what we are trying to find
+y  <- as.numeric(df$incident_response_seconds_qy)
+# in theory higher severity should be faster response time
+x1 <- factor(df$final_severity_level_code)
+# some location better coverage than others?
+x2 <- factor(df$zipcode)
+# different medical necessities treated differently?
+x3 <- factor(df$initial_call_type)
+# Borough underfunded?
+x4 <- factor(df$borough)
+# hour that assignment came effect time?
+time_only <- strptime(df$first_assignment_datetime, format = "%Y-%m-%dT%H:%M:%S")
+x5 <- factor(format(time_only, "%H"))
+head (x5)
+
+#removes na vals
+good <- complete.cases(y, x1, x2, x3, x4, x5)
+
+Y <- matrix(y[good], ncol = 1)
+# after looking stuff up model.matrix automatically creates binary (0,1) vals 
+X <- model.matrix(
+  # tilda makes the intercept 1 col
+  ~ x1 + x2 + x3 + x4 + x5,
+  data = data.frame(
+    x1 = x1[good],
+    x2 = x2[good],
+    x3 = x3[good],
+    x4 = x4[good],
+    x5 = x5[good]
+  )
+)
+
+#head(X)
+#head(Y)
+
+#dim(X)
+#dim(Y)
+  
+# The problem is that X is not invertible due to determinant becoming 0
+# causing a "system is exactly singular: U[12,12] = 0", this fixes it by removing the redundant vals at least according to google
+det(t(X) %*% X)
+qrX <- qr(X)
+X <- X[, qrX$pivot[1:qrX$rank], drop = FALSE]
+
+## -------------------------------
+## Train-Test Split (80-20)
+## -------------------------------
+n <- nrow(X)
+
+set.seed(42)
+train_idx <- sample(1:n, size = 0.8 * n)
+
+X_train <- X[train_idx, ]
+Y_train <- Y[train_idx]
+
+X_test <- X[-train_idx, ]
+Y_test <- Y[-train_idx]
+
+
+## -----------------
+## Linear Regression
+## -----------------
+
+
+# OLS <- solve(t(X_train) %*% X_train) %*% t(X_train) %*% Y_train
+# head(OLS)
+
+lambda <- 12
+I <- diag(ncol(X_train))
+## I was getting a wierd value before where the betaridge  closely resembled ols values except for the first one
+## after some research turns out you don't apply any changes on actuall intercept point
+I[1,1] <- 0
+
+## Model fitting
+
+betaridge <- solve(t(X_train) %*% X_train + lambda * I) %*% t(X_train) %*% Y_train
+head(betaridge)
+
+## Predicting
+
+# Y = X beta
+# Yols <- X_train %*% OLS
+Y_train_ols <- X_train %*% betaridge
+Y_test_ols <- X_test %*% betaridge
+
+## find the rss (plural)
+# RSSols <- sum((Y - Yols)^2)
+# RSSridge <- sum((Y - Yridge)^2)
+# RSSols
+# RSSridge
+
+# Evaluating
+
+MSE_train_ols <- mean((Y_train - Y_train_ols)^2)
+MSE_test_ols  <- mean((Y_test - Y_test_ols)^2)
+
+MSE_train_ols
+MSE_test_ols
+
+# -------------------------------
+# Random Forest Model
+# -------------------------------
+
+set.seed(42)
+
+train_df <- data.frame(Y = Y_train, X_train)
+test_df  <- data.frame(Y = Y_test, X_test)
+
+# Define model and hyperparameters
+rf_model <- randomForest(
+  Y ~ .,
+  data = train_df,
+  mtry = 5,
+  nodesize = 10,
+  maxnodes = 50,
+  ntree = 500
+)
+
+# Predictions
+Y_train_rf <- predict(rf_model, newdata = train_df)
+Y_test_rf  <- predict(rf_model, newdata = test_df)
+
+# Evaluate
+MSE_train_rf <- mean((Y_train - Y_train_rf)^2)
+MSE_test_rf  <- mean((Y_test - Y_test_rf)^2)
+
+MSE_train_rf
+MSE_test_rf
+
+# Comparison Plot
+
+mse_values <- c(
+  MSE_train_ols, MSE_test_ols,
+  MSE_train_rf, MSE_test_rf
+)
+
+labels <- c(
+  "LR Train", "LR Test",
+  "RF Train", "RF Test"
+)
+
+barplot(mse_values,
+        names.arg = labels,
+        main = "Model Comparison: MSE",
+        las = 2)
+
+```
