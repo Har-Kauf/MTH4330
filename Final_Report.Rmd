@@ -1,0 +1,628 @@
+---
+title: "MTH 4330 Project"
+author: "Arthur Faynin"
+date: "2026-04-7"
+output: pdf_document
+header-includes:
+# Add any LaTeX packages you want here -----------------------
+- \usepackage{amsmath}
+- \usepackage{amssymb}
+- \usepackage{graphicx}
+- \usepackage{enumitem}
+---
+
+
+
+<!-- Keep this block  -->
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+# Add any R packages you want here -----------------------
+if (!require(rstudioapi)) {
+  install.packages("rstudioapi")
+  library(rstudioapi)
+}
+if (!require(ranger)) {
+  install.packages("ranger")
+  library(ranger)
+}
+if (!require(glmnet)) {
+  install.packages("glmnet")
+  library(glmnet)
+}
+
+# Do not touch below this line ---------------------------
+# setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  paste0("\n \\", "footnotesize","\n\n", x, "\n\n \\normalsize")
+})
+```
+
+
+```{r echo=TRUE}
+
+# Store local copy of dataset to keep results constant; run once at beginning
+url <- "https://data.cityofnewyork.us/resource/76xm-jjuj.csv?$limit=20000"
+df <- read.csv(url, stringsAsFactors = FALSE)
+write.csv(df, "nyc_data.csv", row.names = FALSE)
+```
+
+```{r echo=TRUE}
+
+## ------------------
+## Data Preprocessing
+## ------------------
+
+# Read data into dataframe
+df <- read.csv("nyc_data.csv", stringsAsFactors = FALSE)
+print("Initial dimensions:")
+dim(df)
+
+# Keep only rows with complete data and positive incident response times
+df <- na.omit(df)
+df <- df[df$incident_response_seconds_qy >= 0, ]
+print("")
+
+
+
+
+
+
+target = df$incident_response_seconds_qy
+feature_df <- subset(df, select = -c(
+  incident_response_seconds_qy,
+  dispatch_response_seconds_qy,
+  incident_travel_tm_seconds_qy
+))
+
+
+# Convert character to factor (better for RFs)
+feature_df[] <- lapply(feature_df, function(col) {
+  if (is.character(col)) factor(col) else col
+})
+
+# Some numeric features should actually be categorical (like zipcode), so converting them to factors
+feature_df$cad_incident_id <- as.factor(feature_df$cad_incident_id)
+feature_df$initial_severity_level_code <- as.factor(feature_df$initial_severity_level_code)
+feature_df$final_severity_level_code <- as.factor(feature_df$final_severity_level_code)
+feature_df$zipcode <- as.factor(feature_df$zipcode)
+feature_df$policeprecinct <- as.factor(feature_df$policeprecinct)
+feature_df$communitydistrict <- as.factor(feature_df$communitydistrict)
+feature_df$citycouncildistrict <- as.factor(feature_df$citycouncildistrict)
+feature_df$communityschooldistrict <- as.factor(feature_df$communityschooldistrict)
+feature_df$congressionaldistrict <- as.factor(feature_df$congressionaldistrict)
+
+# Identify numeric and categorical columns only
+numeric_cols <- names(feature_df)[sapply(feature_df, is.numeric)]
+categorical_cols <- sapply(feature_df, is.factor)
+
+# Count unique values for categorical variables
+unique_counts <- sapply(
+  feature_df[, categorical_cols, drop = FALSE],
+  function(col) length(unique(col))
+)
+
+print("Unique values per feature:")
+sort(unique_counts, decreasing = TRUE)
+print("")
+
+# Threshold identified after inspecting unique value count
+threshold <- 75
+
+# Keep only features below threshold as well as numeric features
+selected_categorical <- names(unique_counts[unique_counts <= threshold])
+selected_features <- c(numeric_cols, selected_categorical)
+
+print("Selected features:")
+print(selected_features)
+print("")
+
+# Create filtered dataframe, but remove features with only one unique value since they're useless
+feature_df <- feature_df[, selected_features, drop = FALSE]
+constant_cols <- sapply(feature_df, function(col) length(unique(col)) == 1)
+feature_df <- feature_df[, !constant_cols]
+print("New dimmensions:")
+dim(feature_df)
+
+# Standardize numeric features
+numeric_cols <- names(feature_df)[sapply(feature_df, is.numeric)]
+feature_df[numeric_cols] <- lapply(feature_df[numeric_cols], function(col) (col - mean(col)) / sd(col))
+head(feature_df[numeric_cols])
+
+# One-hot encode all categorical variables and rejoin features and target
+df_ridge <- model.matrix(~ . - 1, data = feature_df)
+df_ridge <- data.frame(df_ridge, target = target)
+colnames(df_ridge)[which(names(df_ridge) == "target")] <- "incident_response_seconds_qy"
+head(df_ridge)
+dim(df_ridge)
+
+# Frequency encoding for Random Forest and rejoin features with target
+df_rf <- feature_df
+
+for (col in names(df_rf)) {
+  if (is.factor(df_rf[[col]])) {
+    
+    freq_table <- table(df_rf[[col]])
+    freq_map <- freq_table / sum(freq_table)
+    
+    df_rf[[col]] <- freq_map[as.character(df_rf[[col]])]
+  }
+}
+
+df_rf$incident_response_seconds_qy <- target
+head(df_rf)
+dim(df_rf)
+```
+
+```{r echo=TRUE}
+
+# ---------------------
+# Data Splitting
+# ---------------------
+
+set.seed(42)
+
+n <- nrow(df_ridge)
+
+idx <- sample(1:n)
+
+
+
+train_idx <- idx[1:floor(0.7 * n)]
+
+dev_idx <- idx[(floor(0.7 * n) + 1):(floor(0.7 * n) + floor(0.15 * n))]
+
+test_idx <- idx[(floor(0.7 * n) + floor(0.15 * n) + 1):n]
+
+
+# ---------------------
+# Ridge Regression
+# ---------------------
+
+# Data splitting into train, test, and development
+set.seed(42)
+
+n <- nrow(df_ridge)
+
+train <- df_ridge[train_idx, ]
+dev   <- df_ridge[dev_idx, ]
+test  <- df_ridge[test_idx, ]
+
+Y_train <- train$incident_response_seconds_qy
+Y_dev   <- dev$incident_response_seconds_qy
+Y_test  <- test$incident_response_seconds_qy
+
+X_train <- as.matrix(subset(train, select = -incident_response_seconds_qy))
+X_dev   <- as.matrix(subset(dev, select = -incident_response_seconds_qy))
+X_test  <- as.matrix(subset(test, select = -incident_response_seconds_qy))
+
+# Evaluate with RMSE
+rmse <- function(y_true, y_pred) {
+  sqrt(mean((y_true - y_pred)^2))
+}
+# Evaluate with MAE
+mae <- function(y_true, y_pred) {
+  mean(abs(y_true - y_pred))
+}
+
+# Baseline predicts the mean training response time for every observation in seconds
+baseline_value <- mean(Y_train)
+
+baseline_train_preds <- rep(baseline_value, length(Y_train))
+baseline_dev_preds <- rep(baseline_value, length(Y_dev))
+baseline_test_preds <- rep(baseline_value, length(Y_test))
+
+train_rmse_baseline <- rmse(Y_train, baseline_train_preds)
+dev_rmse_baseline <- rmse(Y_dev, baseline_dev_preds)
+test_rmse_baseline <- rmse(Y_test, baseline_test_preds)
+
+train_mae_baseline <- mae(Y_train, baseline_train_preds)
+dev_mae_baseline <- mae(Y_dev, baseline_dev_preds)
+test_mae_baseline <- mae(Y_test, baseline_test_preds)
+
+# Perform grid search to find best lambda from dev set
+lambda_grid <- c(0.01, 0.1, 1, 10, 100, 1000)
+
+ridge_results <- data.frame()
+
+for (lambda in lambda_grid) {
+  
+  model <- glmnet(
+    X_train,
+    Y_train,
+    alpha = 0,
+    lambda = lambda
+  )
+  
+  preds <- predict(model, newx = X_dev)
+  current_rmse <- rmse(Y_dev, preds)
+  
+  ridge_results <- rbind(
+    ridge_results,
+    data.frame(
+      lambda = lambda,
+      rmse = current_rmse
+    )
+  )
+}
+
+# Report Lambda Values Tested
+ridge_results$rmse <- round(ridge_results$rmse, 2)
+print(ridge_results)
+
+best_lambda <- ridge_results$lambda[which.min(ridge_results$rmse)]
+
+final_model <- glmnet(
+  X_train,
+  Y_train,
+  alpha = 0,
+  lambda = best_lambda
+)
+
+train_preds_ridge <- predict(final_model, newx = X_train)
+train_rmse_ridge <- rmse(Y_train, train_preds_ridge)
+train_mae_ridge <- mae(Y_train, train_preds_ridge)
+
+dev_preds_ridge <- predict(final_model, newx = X_dev)
+dev_rmse_ridge <- rmse(Y_dev, dev_preds_ridge)
+dev_mae_ridge <- mae(Y_dev, dev_preds_ridge)
+
+test_preds_ridge <- predict(final_model, newx = X_test)
+test_rmse_ridge <- rmse(Y_test, test_preds_ridge)
+test_mae_ridge <- mae(Y_test, test_preds_ridge)
+
+```
+
+```{r echo=TRUE}
+
+# -------------------------------
+# Random Forest
+# -------------------------------
+
+# Split into train, test, val sets (using splits from before)
+train_rf <- df_rf[train_idx, ]
+dev_rf   <- df_rf[dev_idx, ]
+test_rf  <- df_rf[test_idx, ]
+
+# Define grid of key hyperparameters to iterate over
+num_trees_grid <- c(100, 300, 500)
+max_depth_grid <- c(5, 10, 20)
+min_node_grid <- c(1, 5, 10)
+
+results <- data.frame()
+
+# Perform grid search with validation set, replacing best model/rmse as it goes along
+best_rmse <- Inf
+best_model <- NULL
+
+for (num_trees in num_trees_grid) {
+  for (max_depth in max_depth_grid) {
+    for (min_node in min_node_grid) {
+      
+      model <- ranger(
+        incident_response_seconds_qy ~ .,
+        data = train_rf,
+        num.trees = num_trees,
+        max.depth = max_depth,
+        min.node.size = min_node,
+        seed = 42
+      )
+      
+      preds <- predict(model, data = dev_rf)$predictions
+      current_rmse <- rmse(dev_rf$incident_response_seconds_qy, preds)
+
+      results <- rbind(
+        results,
+        data.frame(
+          num_trees = num_trees,
+          max_depth = max_depth,
+          min_node_size = min_node,
+          rmse = current_rmse
+        )
+      )
+      
+      if (current_rmse < best_rmse) {
+        best_rmse <- current_rmse
+        best_model <- model
+      }
+    }
+  }
+}
+
+best_row <- results[which.min(results$rmse), ]
+
+# Recombine train + development sets for prediction with test set
+train_full_rf <- rbind(train_rf, dev_rf)
+
+final_rf <- ranger(
+  incident_response_seconds_qy  ~ .,
+  data = train_full_rf,
+  num.trees = best_row$num_trees,
+  max.depth = best_row$max_depth,
+  min.node.size = best_row$min_node_size,
+  importance = "impurity",
+  seed = 42
+)
+
+# Evaluate Random Forest with RMSE and MAE
+train_preds_rf <- predict(final_rf, data = train_full_rf)$predictions
+train_rmse_rf <- rmse(train_full_rf$incident_response_seconds_qy, train_preds_rf)
+train_mae_rf <- mae(train_full_rf$incident_response_seconds_qy, train_preds_rf)
+
+dev_preds_rf <- predict(final_rf, data = dev_rf)$predictions
+dev_rmse_rf <- rmse(dev_rf$incident_response_seconds_qy, dev_preds_rf)
+dev_mae_rf <- mae(dev_rf$incident_response_seconds_qy, dev_preds_rf)
+
+test_preds_rf <- predict(final_rf, data = test_rf)$predictions
+test_rmse_rf <- rmse(test_rf$incident_response_seconds_qy, test_preds_rf)
+test_mae_rf <- mae(test_rf$incident_response_seconds_qy, test_preds_rf)
+
+# Report Random Forest Tuning Table
+rf_tuning_results <- results[order(results$rmse), ]
+
+print(head(rf_tuning_results, 10))
+
+# RF Feature Importance 
+rf_importance <- importance(final_rf)
+rf_importance <- sort(rf_importance, decreasing = TRUE)
+
+barplot(
+  head(rf_importance, 8),
+  las = 2,
+  cex.names = 0.5,
+  main = "Random Forest Feature Importances",
+  ylab = "Importance"
+)
+```
+
+
+
+
+
+
+```{r echo=TRUE}
+# -------------------------------
+# Development Set Error Analysis
+# ------------------------------- 
+
+
+dev_errors <- feature_df[dev_idx, ]
+
+
+dev_errors$actual_response <- target[dev_idx]
+dev_errors$predicted_response <- predict(best_model, data = dev_rf)$predictions
+dev_errors$error <- dev_errors$actual_response - dev_errors$predicted_response
+dev_errors$abs_error <- abs(dev_errors$error)
+
+# Largest Under Predictions
+largest_underpredictions <- head(
+  dev_errors[order(-dev_errors$error), ],
+  10
+)
+
+largest_underpredictions[, c(
+  "actual_response",
+  "predicted_response",
+  "error",
+  "borough",
+  "initial_call_type",
+  "initial_severity_level_code"
+)]
+
+# Largest Overpredictions
+largest_overpredictions <- head(
+  dev_errors[order(dev_errors$error), ],
+  10
+)
+
+largest_overpredictions[, c(
+  "actual_response",
+  "predicted_response",
+  "error",
+  "borough",
+  "initial_call_type",
+  "initial_severity_level_code"
+)]
+
+# Borough Error
+borough_error <- aggregate(
+  abs_error ~ borough,
+  data = dev_errors,
+  mean
+)
+
+borough_error <- borough_error[order(-borough_error$abs_error), ]
+
+print(borough_error)
+
+# Severity Error
+severity_error <- aggregate(
+  abs_error ~ initial_severity_level_code,
+  data = dev_errors,
+  mean
+)
+
+severity_error <- severity_error[order(-severity_error$abs_error), ]
+
+print(severity_error)
+
+# Call Type Error
+call_type_error <- aggregate(
+  abs_error ~ initial_call_type,
+  data = dev_errors,
+  mean
+)
+call_type_error <- call_type_error[order(-call_type_error$abs_error), ]
+# Determine Rare Emergency Types via Count
+call_type_counts <- data.frame(
+  initial_call_type = names(table(dev_errors$initial_call_type)),
+  count = as.numeric(table(dev_errors$initial_call_type))
+)
+# Combine Count with Average Error
+call_type_error_with_counts <- merge(
+  call_type_error,
+  call_type_counts,
+  by = "initial_call_type"
+)
+
+call_type_error_with_counts <- call_type_error_with_counts[
+  order(-call_type_error_with_counts$abs_error),
+]
+
+head(call_type_error_with_counts, 10)
+
+# Geographic Error
+dispatch_area_error <- aggregate(
+  abs_error ~ incident_dispatch_area,
+  data = dev_errors,
+  mean
+)
+
+dispatch_area_error <- dispatch_area_error[order(-dispatch_area_error$abs_error), ]
+
+head(dispatch_area_error, 10)
+
+```
+
+
+```{r echo = TRUE}
+# Comparison Plot
+rmse_values <- c(
+  train_rmse_baseline, dev_rmse_baseline, test_rmse_baseline,
+  train_rmse_ridge, dev_rmse_ridge, test_rmse_ridge,
+  train_rmse_rf, dev_rmse_rf, test_rmse_rf
+)
+
+labels <- c(
+  "Base Train", "Base Dev", "Base Test",
+  "Ridge Train", "Ridge Dev", "Ridge Test",
+  "RF Train", "RF Dev", "RF Test"
+)
+#print(selected_features)
+barplot(rmse_values,
+        names.arg = labels,
+        main = "Model Comparison: RMSE",
+        las = 2)
+
+# Final Model Settings
+model_settings <- data.frame(
+  Model = c("Ridge Regression", "Random Forest"),
+  Selected_Settings = c(
+    paste("lambda =", best_lambda),
+    paste(
+      "num.trees =", best_row$num_trees,
+      ", max.depth =", best_row$max_depth,
+      ", min.node.size =", best_row$min_node_size
+    )
+  )
+)
+
+print(model_settings)
+print("")
+
+# Final Selected Features
+print(selected_features)
+
+# Predicted vs Actual Plot
+# Keep X and Y value at same range, visually nicer
+max_val <- max(test_rf$incident_response_seconds_qy, test_preds_rf)
+plot(
+  test_rf$incident_response_seconds_qy,
+  test_preds_rf,
+  xlab = "Actual Response Time (seconds)",
+  ylab = "Predicted Response Time (seconds)",
+  main = "Predicted vs Actual Response Time (RF)",
+  xlim = c(0, max_val),
+  ylim = c(0, max_val)
+)
+# Ideal Predictions
+abline(0, 1)
+
+# Numerical Results
+results_table <- data.frame(
+  Model = c("Baseline Mean", "Ridge Regression", "Random Forest"),
+  
+  Train_RMSE_seconds = round(c(
+    train_rmse_baseline,
+    train_rmse_ridge,
+    train_rmse_rf
+  ), 0),
+  
+  Dev_RMSE_seconds = round(c(
+    dev_rmse_baseline,
+    dev_rmse_ridge,
+    dev_rmse_rf
+  ), 0),
+  
+  Test_RMSE_seconds = round(c(
+    test_rmse_baseline,
+    test_rmse_ridge,
+    test_rmse_rf
+  ), 0),
+  
+  Train_MAE_seconds = round(c(
+    train_mae_baseline,
+    train_mae_ridge,
+    train_mae_rf
+  ), 0),
+  
+  Dev_MAE_seconds = round(c(
+    dev_mae_baseline,
+    dev_mae_ridge,
+    dev_mae_rf
+  ), 0),
+  
+  Test_MAE_seconds = round(c(
+    test_mae_baseline,
+    test_mae_ridge,
+    test_mae_rf
+  ), 0)
+  
+  # Test_RMSE_minutes = round(c(
+  #   test_rmse_baseline,
+  #   test_rmse_ridge,
+  #   test_rmse_rf
+  # ) / 60, 2),
+  # 
+  # Test_MAE_minutes = round(c(
+  #   test_mae_baseline,
+  #   test_mae_ridge,
+  #   test_mae_rf
+  # ) / 60, 2)
+)
+
+print(results_table)
+
+# Error based on Particular Values
+# Error based on Borough
+barplot(
+  borough_error$abs_error,
+  names.arg = borough_error$borough,
+  las = 2,
+  main = "Development MAE by Borough (RF)",
+  ylab = "Mean Absolute Error (seconds)",
+  cex.names = 0.8
+)
+# Error based on Severity
+barplot(
+  severity_error$abs_error,
+  names.arg = severity_error$initial_severity_level_code,
+  las = 2,
+  main = "Development Error by Severity Level (RF)",
+  ylab = "Mean Absolute Error (seconds)"
+)
+# Error based on Call Type
+top_call_type_error <- head(call_type_error, 10)
+
+barplot(
+  top_call_type_error$abs_error,
+  names.arg = top_call_type_error$initial_call_type,
+  las = 2,
+  main = "Top 10 Development Errors by Call Type (RF)",
+  ylab = "Mean Absolute Error (seconds)"
+)
+
+
+```
